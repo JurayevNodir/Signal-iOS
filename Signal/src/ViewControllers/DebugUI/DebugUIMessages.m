@@ -10,10 +10,12 @@
 #import <AxolotlKit/PreKeyBundle.h>
 #import <Curve25519Kit/Randomness.h>
 #import <SignalMessaging/Environment.h>
+#import <SignalServiceKit/MIMETypeUtil.h>
 #import <SignalServiceKit/NSDate+OWS.h>
 #import <SignalServiceKit/OWSBatchMessageProcessor.h>
 #import <SignalServiceKit/OWSDisappearingConfigurationUpdateInfoMessage.h>
 #import <SignalServiceKit/OWSDisappearingMessagesConfiguration.h>
+#import <SignalServiceKit/OWSMessageUtils.h>
 #import <SignalServiceKit/OWSPrimaryStorage+SessionStore.h>
 #import <SignalServiceKit/OWSSyncGroupsRequestMessage.h>
 #import <SignalServiceKit/OWSVerificationStateChangeMessage.h>
@@ -22,10 +24,10 @@
 #import <SignalServiceKit/TSDatabaseView.h>
 #import <SignalServiceKit/TSIncomingMessage.h>
 #import <SignalServiceKit/TSInvalidIdentityKeyReceivingErrorMessage.h>
+#import <SignalServiceKit/TSOutgoingMessage.h>
 #import <SignalServiceKit/TSThread.h>
 
 NS_ASSUME_NONNULL_BEGIN
-
 
 @interface TSOutgoingMessage (PostDatingDebug)
 
@@ -308,6 +310,10 @@ NS_ASSUME_NONNULL_BEGIN
                         actionBlock:^{
                             [DebugUIMessages testDirectionalFilenamesInThread:thread];
                         }],
+        [OWSTableItem itemWithTitle:@"Create fake quoted replies"
+                        actionBlock:^{
+                            [DebugUIMessages createFakeQuotedRepliesInThread:thread];
+                        }],
     ] mutableCopy];
     if ([thread isKindOfClass:[TSContactThread class]]) {
         TSContactThread *contactThread = (TSContactThread *)thread;
@@ -423,15 +429,10 @@ NS_ASSUME_NONNULL_BEGIN
     }
 }
 
-+ (void)sendAttachment:(NSString *)filePath
-                thread:(TSThread *)thread
-               success:(nullable void (^)(void))success
-               failure:(nullable void (^)(void))failure
++ (SignalAttachment *)signalAttachmentForFilePath:(NSString *)filePath
 {
     OWSAssert(filePath);
-    OWSAssert(thread);
 
-    OWSMessageSender *messageSender = [Environment current].messageSender;
     NSString *filename = [filePath lastPathComponent];
     NSString *utiType = [MIMETypeUtil utiTypeForFileExtension:filename.pathExtension];
     DataSource *_Nullable dataSource = [DataSourcePath dataSourceWithFilePath:filePath];
@@ -448,6 +449,19 @@ NS_ASSUME_NONNULL_BEGIN
         [DDLog flushLog];
     }
     OWSAssert(![attachment hasError]);
+    return attachment;
+}
+
++ (void)sendAttachment:(NSString *)filePath
+                thread:(TSThread *)thread
+               success:(nullable void (^)(void))success
+               failure:(nullable void (^)(void))failure
+{
+    OWSAssert(filePath);
+    OWSAssert(thread);
+
+    SignalAttachment *attachment = [self signalAttachmentForFilePath:filePath];
+    OWSMessageSender *messageSender = [Environment current].messageSender;
     [ThreadUtil sendMessageWithAttachment:attachment inThread:thread messageSender:messageSender completion:nil];
     success();
 }
@@ -984,11 +998,15 @@ NS_ASSUME_NONNULL_BEGIN
     [OWSPrimaryStorage.dbReadWriteConnection readWriteWithBlock:^(YapDatabaseReadWriteTransaction *transaction) {
         for (int i = 0; i < counter; i++) {
             NSString *randomText = [self randomText];
-            TSIncomingMessage *message = [[TSIncomingMessage alloc] initWithTimestamp:[NSDate ows_millisecondTimeStamp]
-                                                                             inThread:thread
-                                                                             authorId:@"+19174054215"
-                                                                       sourceDeviceId:0
-                                                                          messageBody:randomText];
+            TSIncomingMessage *message =
+                [[TSIncomingMessage alloc] initIncomingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                                   inThread:thread
+                                                                   authorId:@"+19174054215"
+                                                             sourceDeviceId:0
+                                                                messageBody:randomText
+                                                              attachmentIds:@[]
+                                                           expiresInSeconds:0
+                                                              quotedMessage:nil];
             [message saveWithTransaction:transaction];
         }
     }];
@@ -1053,19 +1071,28 @@ NS_ASSUME_NONNULL_BEGIN
         switch (arc4random_uniform(isTextOnly ? 2 : 4)) {
             case 0: {
                 TSIncomingMessage *message =
-                    [[TSIncomingMessage alloc] initWithTimestamp:[NSDate ows_millisecondTimeStamp]
-                                                        inThread:thread
-                                                        authorId:@"+19174054215"
-                                                  sourceDeviceId:0
-                                                     messageBody:randomText];
+                    [[TSIncomingMessage alloc] initIncomingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                                       inThread:thread
+                                                                       authorId:@"+19174054215"
+                                                                 sourceDeviceId:0
+                                                                    messageBody:randomText
+                                                                  attachmentIds:@[]
+                                                               expiresInSeconds:0
+                                                                  quotedMessage:nil];
                 [message markAsReadWithTransaction:transaction sendReadReceipt:NO updateExpiration:NO];
                 break;
             }
             case 1: {
                 TSOutgoingMessage *message =
-                    [[TSOutgoingMessage alloc] initWithTimestamp:[NSDate ows_millisecondTimeStamp]
-                                                        inThread:thread
-                                                     messageBody:randomText];
+                    [[TSOutgoingMessage alloc] initOutgoingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                                       inThread:thread
+                                                                    messageBody:randomText
+                                                                  attachmentIds:[NSMutableArray new]
+                                                               expiresInSeconds:0
+                                                                expireStartedAt:0
+                                                                 isVoiceMessage:NO
+                                                               groupMetaMessage:TSGroupMessageNone
+                                                                  quotedMessage:nil];
                 [message saveWithTransaction:transaction];
                 [message updateWithMessageState:TSOutgoingMessageStateUnsent transaction:transaction];
                 break;
@@ -1084,25 +1111,30 @@ NS_ASSUME_NONNULL_BEGIN
                 pointer.state = TSAttachmentPointerStateFailed;
                 [pointer saveWithTransaction:transaction];
                 TSIncomingMessage *message =
-                    [[TSIncomingMessage alloc] initWithTimestamp:[NSDate ows_millisecondTimeStamp]
-                                                        inThread:thread
-                                                        authorId:@"+19174054215"
-                                                  sourceDeviceId:0
-                                                     messageBody:nil
-                                                   attachmentIds:@[
-                                                       pointer.uniqueId,
-                                                   ]
-                                                expiresInSeconds:0];
+                    [[TSIncomingMessage alloc] initIncomingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                                       inThread:thread
+                                                                       authorId:@"+19174054215"
+                                                                 sourceDeviceId:0
+                                                                    messageBody:nil
+                                                                  attachmentIds:@[
+                                                                      pointer.uniqueId,
+                                                                  ]
+                                                               expiresInSeconds:0
+                                                                  quotedMessage:nil];
                 [message markAsReadWithTransaction:transaction sendReadReceipt:NO updateExpiration:NO];
                 break;
             }
             case 3: {
                 TSOutgoingMessage *message =
-                    [[TSOutgoingMessage alloc] initWithTimestamp:[NSDate ows_millisecondTimeStamp]
-                                                        inThread:thread
-                                                     messageBody:nil
-                                                  isVoiceMessage:NO
-                                                expiresInSeconds:0];
+                    [[TSOutgoingMessage alloc] initOutgoingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                                       inThread:thread
+                                                                    messageBody:nil
+                                                                  attachmentIds:[NSMutableArray new]
+                                                               expiresInSeconds:0
+                                                                expireStartedAt:0
+                                                                 isVoiceMessage:NO
+                                                               groupMetaMessage:TSGroupMessageNone
+                                                                  quotedMessage:nil];
 
                 NSString *filename = @"test.mp3";
                 UInt32 filesize = 16;
@@ -1215,11 +1247,15 @@ NS_ASSUME_NONNULL_BEGIN
         if (arc4random() % 2 == 2) {
             randomCaption = [self randomText];
         }
-        TSOutgoingMessage *message = [[TSOutgoingMessage alloc] initWithTimestamp:timestamp
-                                                                         inThread:thread
-                                                                      messageBody:randomCaption
-                                                                   isVoiceMessage:NO
-                                                                 expiresInSeconds:0];
+        TSOutgoingMessage *message = [[TSOutgoingMessage alloc] initOutgoingMessageWithTimestamp:timestamp
+                                                                                        inThread:thread
+                                                                                     messageBody:randomCaption
+                                                                                   attachmentIds:[NSMutableArray new]
+                                                                                expiresInSeconds:0
+                                                                                 expireStartedAt:0
+                                                                                  isVoiceMessage:NO
+                                                                                groupMetaMessage:TSGroupMessageNone
+                                                                                   quotedMessage:nil];
         [message setReceivedAtTimestamp:timestamp];
 
         TSAttachmentStream *attachmentStream;
@@ -1278,11 +1314,16 @@ NS_ASSUME_NONNULL_BEGIN
     }
 
     [OWSPrimaryStorage.dbReadWriteConnection readWriteWithBlock:^(YapDatabaseReadWriteTransaction *transaction) {
-        TSOutgoingMessage *message = [[TSOutgoingMessage alloc] initWithTimestamp:[NSDate ows_millisecondTimeStamp]
-                                                                         inThread:thread
-                                                                      messageBody:nil
-                                                                   isVoiceMessage:NO
-                                                                 expiresInSeconds:0];
+        TSOutgoingMessage *message =
+            [[TSOutgoingMessage alloc] initOutgoingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                               inThread:thread
+                                                            messageBody:nil
+                                                          attachmentIds:[NSMutableArray new]
+                                                       expiresInSeconds:0
+                                                        expireStartedAt:0
+                                                         isVoiceMessage:NO
+                                                       groupMetaMessage:TSGroupMessageNone
+                                                          quotedMessage:nil];
         DDLogError(@"%@ sendFakeMessages outgoing attachment timestamp: %llu.", self.logTag, message.timestamp);
 
         NSString *filename = @"test.mp3";
@@ -1352,9 +1393,16 @@ NS_ASSUME_NONNULL_BEGIN
         }];
     OWSAssert(thread);
 
-    TSOutgoingMessage *message = [[TSOutgoingMessage alloc] initWithTimestamp:[NSDate ows_millisecondTimeStamp]
-                                                                     inThread:thread
-                                                             groupMetaMessage:TSGroupMessageNew];
+    TSOutgoingMessage *message =
+        [[TSOutgoingMessage alloc] initOutgoingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                           inThread:thread
+                                                        messageBody:nil
+                                                      attachmentIds:[NSMutableArray new]
+                                                   expiresInSeconds:0
+                                                    expireStartedAt:0
+                                                     isVoiceMessage:NO
+                                                   groupMetaMessage:TSGroupMessageNew
+                                                      quotedMessage:nil];
     [message updateWithCustomMessage:NSLocalizedString(@"GROUP_CREATED", nil)];
 
     OWSMessageSender *messageSender = [Environment current].messageSender;
@@ -1603,12 +1651,16 @@ NS_ASSUME_NONNULL_BEGIN
         NSString *text = [self randomText];
         OWSDisappearingMessagesConfiguration *configuration =
             [OWSDisappearingMessagesConfiguration fetchObjectWithUniqueID:thread.uniqueId transaction:transaction];
-        TSOutgoingMessage *message =
-        [[TSOutgoingMessage alloc] initWithTimestamp:[NSDate ows_millisecondTimeStamp]
-                                            inThread:thread
-                                         messageBody:text
-                                       attachmentIds:[NSMutableArray new]
-                                    expiresInSeconds:(configuration.isEnabled ? configuration.durationSeconds : 0)];
+        TSOutgoingMessage *message = [[TSOutgoingMessage alloc]
+            initOutgoingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                    inThread:thread
+                                 messageBody:text
+                               attachmentIds:[NSMutableArray new]
+                            expiresInSeconds:(configuration.isEnabled ? configuration.durationSeconds
+                                                                      : 0)expireStartedAt:0
+                              isVoiceMessage:NO
+                            groupMetaMessage:TSGroupMessageNone
+                               quotedMessage:nil];
         DDLogError(@"%@ insertAndDeleteNewOutgoingMessages timestamp: %llu.", self.logTag, message.timestamp);
         [messages addObject:message];
     }
@@ -1633,12 +1685,16 @@ NS_ASSUME_NONNULL_BEGIN
         OWSDisappearingMessagesConfiguration *configuration =
             [OWSDisappearingMessagesConfiguration fetchObjectWithUniqueID:thread.uniqueId
                                                               transaction:initialTransaction];
-        TSOutgoingMessage *message =
-        [[TSOutgoingMessage alloc] initWithTimestamp:[NSDate ows_millisecondTimeStamp]
-                                            inThread:thread
-                                         messageBody:text
-                                       attachmentIds:[NSMutableArray new]
-                                    expiresInSeconds:(configuration.isEnabled ? configuration.durationSeconds : 0)];
+        TSOutgoingMessage *message = [[TSOutgoingMessage alloc]
+            initOutgoingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                    inThread:thread
+                                 messageBody:text
+                               attachmentIds:[NSMutableArray new]
+                            expiresInSeconds:(configuration.isEnabled ? configuration.durationSeconds
+                                                                      : 0)expireStartedAt:0
+                              isVoiceMessage:NO
+                            groupMetaMessage:TSGroupMessageNone
+                               quotedMessage:nil];
         DDLogError(@"%@ resurrectNewOutgoingMessages1 timestamp: %llu.", self.logTag, message.timestamp);
         [messages addObject:message];
     }
@@ -1672,12 +1728,16 @@ NS_ASSUME_NONNULL_BEGIN
         OWSDisappearingMessagesConfiguration *configuration =
             [OWSDisappearingMessagesConfiguration fetchObjectWithUniqueID:thread.uniqueId
                                                               transaction:initialTransaction];
-        TSOutgoingMessage *message =
-        [[TSOutgoingMessage alloc] initWithTimestamp:[NSDate ows_millisecondTimeStamp]
-                                            inThread:thread
-                                         messageBody:text
-                                       attachmentIds:[NSMutableArray new]
-                                    expiresInSeconds:(configuration.isEnabled ? configuration.durationSeconds : 0)];
+        TSOutgoingMessage *message = [[TSOutgoingMessage alloc]
+            initOutgoingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                    inThread:thread
+                                 messageBody:text
+                               attachmentIds:[NSMutableArray new]
+                            expiresInSeconds:(configuration.isEnabled ? configuration.durationSeconds
+                                                                      : 0)expireStartedAt:0
+                              isVoiceMessage:NO
+                            groupMetaMessage:TSGroupMessageNone
+                               quotedMessage:nil];
         DDLogError(@"%@ resurrectNewOutgoingMessages2 timestamp: %llu.", self.logTag, message.timestamp);
         [messages addObject:message];
     }
@@ -1735,18 +1795,27 @@ NS_ASSUME_NONNULL_BEGIN
             NSString *randomText = [self randomText];
             {
                 TSIncomingMessage *message =
-                    [[TSIncomingMessage alloc] initWithTimestamp:timestamp.unsignedLongLongValue
-                                                        inThread:thread
-                                                        authorId:recipientId
-                                                  sourceDeviceId:0
-                                                     messageBody:randomText];
+                    [[TSIncomingMessage alloc] initIncomingMessageWithTimestamp:timestamp.unsignedLongLongValue
+                                                                       inThread:thread
+                                                                       authorId:recipientId
+                                                                 sourceDeviceId:0
+                                                                    messageBody:randomText
+                                                                  attachmentIds:[NSMutableArray new]
+                                                               expiresInSeconds:0
+                                                                  quotedMessage:nil];
                 [message markAsReadWithTransaction:transaction sendReadReceipt:NO updateExpiration:NO];
             }
             {
                 TSOutgoingMessage *message =
-                    [[TSOutgoingMessage alloc] initWithTimestamp:timestamp.unsignedLongLongValue
-                                                        inThread:thread
-                                                     messageBody:randomText];
+                    [[TSOutgoingMessage alloc] initOutgoingMessageWithTimestamp:timestamp.unsignedLongLongValue
+                                                                       inThread:thread
+                                                                    messageBody:randomText
+                                                                  attachmentIds:[NSMutableArray new]
+                                                               expiresInSeconds:0
+                                                                expireStartedAt:0
+                                                                 isVoiceMessage:NO
+                                                               groupMetaMessage:TSGroupMessageNone
+                                                                  quotedMessage:nil];
                 [message saveWithTransaction:transaction];
                 [message updateWithMessageState:TSOutgoingMessageStateSentToService transaction:transaction];
                 [message updateWithSentRecipient:recipientId transaction:transaction];
@@ -1777,11 +1846,14 @@ NS_ASSUME_NONNULL_BEGIN
 
                 {
                     TSIncomingMessage *message =
-                        [[TSIncomingMessage alloc] initWithTimestamp:[NSDate ows_millisecondTimeStamp]
-                                                            inThread:thread
-                                                            authorId:@"+19174054215"
-                                                      sourceDeviceId:0
-                                                         messageBody:string];
+                        [[TSIncomingMessage alloc] initIncomingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                                           inThread:thread
+                                                                           authorId:@"+19174054215"
+                                                                     sourceDeviceId:0
+                                                                        messageBody:string
+                                                                      attachmentIds:[NSMutableArray new]
+                                                                   expiresInSeconds:0
+                                                                      quotedMessage:nil];
                     [message saveWithTransaction:transaction];
                     [message markAsReadWithTransaction:transaction sendReadReceipt:NO updateExpiration:NO];
                 }
@@ -1818,11 +1890,14 @@ NS_ASSUME_NONNULL_BEGIN
 
                 {
                     TSIncomingMessage *message =
-                        [[TSIncomingMessage alloc] initWithTimestamp:[NSDate ows_millisecondTimeStamp]
-                                                            inThread:thread
-                                                            authorId:@"+19174054215"
-                                                      sourceDeviceId:0
-                                                         messageBody:string];
+                        [[TSIncomingMessage alloc] initIncomingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                                           inThread:thread
+                                                                           authorId:@"+19174054215"
+                                                                     sourceDeviceId:0
+                                                                        messageBody:string
+                                                                      attachmentIds:[NSMutableArray new]
+                                                                   expiresInSeconds:0
+                                                                      quotedMessage:nil];
                     [message saveWithTransaction:transaction];
                     [message markAsReadWithTransaction:transaction sendReadReceipt:NO updateExpiration:NO];
                 }
@@ -1880,6 +1955,200 @@ NS_ASSUME_NONNULL_BEGIN
             sendUnsafeFile();
         });
     };
+}
+
++ (void)createFakeQuotedRepliesInThread:(TSThread *)thread
+{
+    [self ensureRandomJpegWithSuccess:^(NSString *filePath) {
+        [self createFakeQuotedRepliesInThread:thread jpegFilePath:filePath];
+    }
+                              failure:^{
+                              }];
+}
+
++ (void)createFakeQuotedRepliesInThread:(TSThread *)thread jpegFilePath:(NSString *)jpegFilePath
+{
+    [OWSPrimaryStorage.dbReadWriteConnection readWriteWithBlock:^(YapDatabaseReadWriteTransaction *transaction) {
+        int counter = 0;
+
+        {
+            // Reply to yourself, text.
+
+            NSString *text =
+                [[[@(counter) description] stringByAppendingString:@" "] stringByAppendingString:[self randomText]];
+            TSOutgoingMessage *message =
+                [[TSOutgoingMessage alloc] initOutgoingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                                   inThread:thread
+                                                                messageBody:text
+                                                              attachmentIds:[NSMutableArray new]
+                                                           expiresInSeconds:0
+                                                            expireStartedAt:0
+                                                             isVoiceMessage:NO
+                                                           groupMetaMessage:TSGroupMessageNone
+                                                              quotedMessage:nil];
+            [message saveWithTransaction:transaction];
+            [message updateWithMessageState:TSOutgoingMessageStateUnsent transaction:transaction];
+
+            [self createFakeQuotedReplyToMessage:message thread:thread transaction:transaction];
+        }
+
+        {
+            // Reply to other user, text.
+
+            NSString *text =
+                [[[@(counter) description] stringByAppendingString:@" "] stringByAppendingString:[self randomText]];
+            TSIncomingMessage *message =
+                [[TSIncomingMessage alloc] initIncomingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                                   inThread:thread
+                                                                   authorId:@"+19174054215"
+                                                             sourceDeviceId:0
+                                                                messageBody:text
+                                                              attachmentIds:@[]
+                                                           expiresInSeconds:0
+                                                              quotedMessage:nil];
+            [message saveWithTransaction:transaction];
+
+            [self createFakeQuotedReplyToMessage:message thread:thread transaction:transaction];
+        }
+
+        {
+            // Reply to other user, mp3.
+
+            UInt32 filesize = 64;
+            TSAttachmentPointer *pointer =
+                [[TSAttachmentPointer alloc] initWithServerId:237391539706350548
+                                                          key:[self createRandomNSDataOfSize:filesize]
+                                                       digest:nil
+                                                    byteCount:filesize
+                                                  contentType:@"audio/mp3"
+                                                        relay:@""
+                                               sourceFilename:@"test.mp3"
+                                               attachmentType:TSAttachmentTypeDefault];
+            pointer.state = TSAttachmentPointerStateFailed;
+            [pointer saveWithTransaction:transaction];
+            TSIncomingMessage *message =
+                [[TSIncomingMessage alloc] initIncomingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                                   inThread:thread
+                                                                   authorId:@"+19174054215"
+                                                             sourceDeviceId:0
+                                                                messageBody:nil
+                                                              attachmentIds:@[
+                                                                  pointer.uniqueId,
+                                                              ]
+                                                           expiresInSeconds:0
+                                                              quotedMessage:nil];
+            [message markAsReadWithTransaction:transaction sendReadReceipt:NO updateExpiration:NO];
+
+            [self createFakeQuotedReplyToMessage:message thread:thread transaction:transaction];
+        }
+
+        {
+            // Reply to self, jpg with caption.
+
+            SignalAttachment *attachment = [self signalAttachmentForFilePath:jpegFilePath];
+            attachment.captionText = [self randomCaptionText];
+            TSOutgoingMessage *message =
+                [[TSOutgoingMessage alloc] initOutgoingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                                   inThread:thread
+                                                                messageBody:attachment.captionText
+                                                              attachmentIds:[NSMutableArray new]
+                                                           expiresInSeconds:0
+                                                            expireStartedAt:0
+                                                             isVoiceMessage:[attachment isVoiceMessage]
+                                                           groupMetaMessage:TSGroupMessageNone
+                                                              quotedMessage:nil];
+            DataSource *dataSource = attachment.dataSource;
+            TSAttachmentStream *attachmentStream =
+                [[TSAttachmentStream alloc] initWithContentType:attachment.mimeType
+                                                      byteCount:(UInt32)dataSource.dataLength
+                                                 sourceFilename:attachment.filenameOrDefault];
+            if (message.isVoiceMessage) {
+                attachmentStream.attachmentType = TSAttachmentTypeVoiceMessage;
+            }
+
+            if (![attachmentStream writeDataSource:dataSource]) {
+                OWSFail(@"%@ could not write attachment data", self.logTag);
+            }
+
+            [attachmentStream save];
+            [message.attachmentIds addObject:attachmentStream.uniqueId];
+            if (attachment.filenameOrDefault) {
+                message.attachmentFilenameMap[attachmentStream.uniqueId] = attachment.filenameOrDefault;
+            }
+            [message saveWithTransaction:transaction];
+            [message updateWithMessageState:TSOutgoingMessageStateUnsent transaction:transaction];
+
+            [self createFakeQuotedReplyToMessage:message thread:thread transaction:transaction];
+        }
+
+        {
+            // Reply to other user, jpg with caption.
+
+            SignalAttachment *attachment = [self signalAttachmentForFilePath:jpegFilePath];
+            attachment.captionText = [self randomCaptionText];
+            DataSource *dataSource = attachment.dataSource;
+            TSAttachmentStream *attachmentStream =
+                [[TSAttachmentStream alloc] initWithContentType:attachment.mimeType
+                                                      byteCount:(UInt32)dataSource.dataLength
+                                                 sourceFilename:attachment.filenameOrDefault];
+
+            if (![attachmentStream writeDataSource:dataSource]) {
+                OWSFail(@"%@ could not write attachment data", self.logTag);
+            }
+
+            [attachmentStream save];
+
+            TSIncomingMessage *message =
+                [[TSIncomingMessage alloc] initIncomingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                                   inThread:thread
+                                                                   authorId:@"+19174054215"
+                                                             sourceDeviceId:0
+                                                                messageBody:nil
+                                                              attachmentIds:@[
+                                                                  attachmentStream.uniqueId,
+                                                              ]
+                                                           expiresInSeconds:0
+                                                              quotedMessage:nil];
+            [message markAsReadWithTransaction:transaction sendReadReceipt:NO updateExpiration:NO];
+
+            [self createFakeQuotedReplyToMessage:message thread:thread transaction:transaction];
+        }
+    }];
+}
+
++ (void)createFakeQuotedReplyToMessage:(TSMessage *)message
+                                thread:(TSThread *)thread
+                           transaction:(YapDatabaseReadWriteTransaction *)transaction
+{
+    OWSAssert(message);
+    OWSAssert(thread);
+    OWSAssert(transaction);
+
+    TSQuotedMessage *_Nullable quotedMessage = nil;
+    if ([message isKindOfClass:[TSIncomingMessage class]]) {
+        quotedMessage =
+            [OWSMessageUtils quotedMessageForIncomingMessage:(TSIncomingMessage *)message transaction:transaction];
+    } else if ([message isKindOfClass:[TSOutgoingMessage class]]) {
+        quotedMessage =
+            [OWSMessageUtils quotedMessageForOutgoingMessage:(TSOutgoingMessage *)message transaction:transaction];
+    } else {
+        OWSFail(@"%@ unexpected message type: %@", self.logTag, [message class]);
+    }
+    OWSAssert(quotedMessage);
+
+    NSString *replyText = [@"Some reply: " stringByAppendingString:[self randomText]];
+    TSOutgoingMessage *replyMessage =
+        [[TSOutgoingMessage alloc] initOutgoingMessageWithTimestamp:[NSDate ows_millisecondTimeStamp]
+                                                           inThread:thread
+                                                        messageBody:replyText
+                                                      attachmentIds:[NSMutableArray new]
+                                                   expiresInSeconds:0
+                                                    expireStartedAt:0
+                                                     isVoiceMessage:NO
+                                                   groupMetaMessage:TSGroupMessageNone
+                                                      quotedMessage:quotedMessage];
+    [replyMessage saveWithTransaction:transaction];
+    [replyMessage updateWithMessageState:TSOutgoingMessageStateUnsent transaction:transaction];
 }
 
 @end
